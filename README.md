@@ -34,26 +34,37 @@ python -c "import av; print('libx265' in [c for c in av.codecs_available])"
 
 ## Sử dụng
 
-### Bước 1 — Convert SVO2 sang MCAP
+Bộ gồm 2 file: `mcap_converter.py` (cắt + convert) và `export_metadata.py` (xuất metadata).
+
+### Bước 1 — Cắt SVO2 và convert sang MCAP
+
+Script luôn cắt SVO2 theo khoảng thời gian rồi mới convert. File SVO2 đã cắt được lưu vào thư mục chỉ định qua `--clip-dir`.
 
 ```bash
-# Test nhanh với 100 frame trước
-python mcap_converter.py video.svo2 video.mcap --max-frames 100
+# Cắt từ giây thứ 2 đến giây 41, lưu clip vào ./clips rồi convert
+python mcap_converter.py video.svo2 video.mcap \
+  --start 00:00:02 --end 00:00:41 --clip-dir ./clips
 
-# Chạy đầy đủ
-python mcap_converter.py video.svo2 video.mcap
+# Test nhanh: chỉ convert 100 frame đầu của đoạn đã cắt
+python mcap_converter.py video.svo2 video.mcap \
+  --start 00:00:02 --end 00:00:41 --clip-dir ./clips --max-frames 100
 ```
 
 Tham số:
 
-- `input` : đường dẫn file `.svo2`
+- `input` : đường dẫn file `.svo2` gốc
 - `output` : đường dẫn file `.mcap` xuất ra
-- `--max-frames N` : chỉ xử lý N frame đầu (0 = toàn bộ)
+- `--start` : thời điểm bắt đầu cắt, định dạng `HH:MM:SS` (hỗ trợ cả `MM:SS`, `SS`) — bắt buộc
+- `--end` : thời điểm kết thúc cắt, định dạng `HH:MM:SS` — bắt buộc
+- `--clip-dir` : thư mục lưu file SVO2 đã cắt (tự tạo nếu chưa có) — bắt buộc
+- `--max-frames N` : chỉ convert N frame đầu của đoạn đã cắt (0 = toàn bộ)
+
+File clip được đặt tên `<tên_gốc>_clip_<frame_start>_<frame_end>.svo2` trong `--clip-dir`.
 
 ### Bước 2 — Xuất metadata
 
 ```bash
-python mcap_to_metadata.py video.mcap metadata_sample.yaml
+python export_metadata.py video.mcap metadata_sample.yaml
 ```
 
 Xuất file YAML liệt kê từng topic kèm schema, encoding, count và giá trị mẫu từ message đầu tiên.
@@ -98,8 +109,10 @@ Quá trình chậm chủ yếu do encode H.265 và tính depth mỗi frame. Mặ
 | `unexpected keyword argument` ở schema | Tên field khác giữa các bản SDK; chạy `help(<Schema>)` để xem tên đúng |
 | `Timestamp` lỗi tham số | Bản SDK dùng `sec`/`nsec` thay vì `seconds`/`nanos` |
 | `libx265` không có | PyAV thiếu build libx265; cài lại PyAV bản đầy đủ |
+| Lỗi `H265` ở recording khi cắt | Đổi `SVO_COMPRESSION_MODE.H265` sang `H264` hoặc `LOSSLESS` |
+| File clip rỗng | Kiểm tra `--start`/`--end` nằm trong thời lượng video; start phải nhỏ hơn end |
 | Chạy quá chậm | Xem mục Tăng tốc |
 
 ## Kiểm tra kết quả
 
-M�� file `.mcap` trong Foxglove Studio (app desktop hoặc web), xác nhận đủ 9 topic và ảnh H.265 hiển thị được. Nên kiểm tra với bản `--max-frames 100` trước khi chạy full.
+Mở file `.mcap` trong Foxglove Studio (app desktop hoặc web), xác nhận đủ 9 topic và ảnh H.265 hiển thị được. Nên kiểm tra với bản `--max-frames 100` trước khi chạy full.

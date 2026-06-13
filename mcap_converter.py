@@ -5,11 +5,15 @@ Convert ZED SVO2 -> MCAP (foxglove-sdk, version dùng foxglove.messages).
 - /ego/imu, /ego/vio/system_info : JSON schema tự định nghĩa (đúng tên trường yaml)
 - các topic còn lại               : schema built-in của foxglove.messages
 
+Quy trình: CẮT svo2 theo start/end (HH:MM:SS) -> lưu file svo2 đã cắt vào
+thư mục user chỉ định -> CONVERT file đã cắt sang MCAP.
+
 Cài: pip install foxglove-sdk av numpy   (pyzed có sẵn sau khi cài ZED SDK)
 Dùng:
-  python svo2_to_mcap_v3.py input.svo2 output.mcap
-  python svo2_to_mcap_v3.py input.svo2 output.mcap --max-frames 100
+  python svo2_to_mcap_v3.py input.svo2 output.mcap --start 00:00:02 --end 00:00:41 --clip-dir ./clips
+  python svo2_to_mcap_v3.py input.svo2 output.mcap --start 00:00:02 --end 00:00:41 --clip-dir ./clips --max-frames 100
 """
+import os
 import sys
 import json
 import argparse
@@ -131,15 +135,105 @@ def make_calibration(ts, frame_id, w, h, cp):
     )
 
 
+def parse_hhmmss(s: str) -> float:
+    """'HH:MM:SS' hoặc 'MM:SS' hoặc 'SS' -> số giây (float)."""
+    parts = s.strip().split(":")
+    parts = [float(p) for p in parts]
+    if len(parts) == 3:
+        h, m, sec = parts
+    elif len(parts) == 2:
+        h, m, sec = 0.0, parts[0], parts[1]
+    elif len(parts) == 1:
+        h, m, sec = 0.0, 0.0, parts[0]
+    else:
+        raise ValueError(f"Định dạng thời gian không hợp lệ: {s}")
+    return h * 3600 + m * 60 + sec
+
+
+def clip_svo(input_svo: str, clip_dir: str, start_s: float, end_s: float) -> str:
+    """
+    Cắt SVO2 từ start_s đến end_s (giây), lưu file mới vào clip_dir.
+    Trả về đường dẫn file svo2 đã cắt.
+    """
+    os.makedirs(clip_dir, exist_ok=True)
+
+    init = sl.InitParameters()
+    init.set_from_svo_file(input_svo)
+    init.svo_real_time_mode = False
+    init.depth_mode = sl.DEPTH_MODE.NONE   # cắt không cần depth -> nhanh
+
+    cam = sl.Camera()
+    if cam.open(init) != sl.ERROR_CODE.SUCCESS:
+        print("Không mở được file SVO2 để cắt")
+        sys.exit(1)
+
+    fps = cam.get_camera_information().camera_configuration.fps or 30
+    total = cam.get_svo_number_of_frames()
+
+    start_f = max(0, int(round(start_s * fps)))
+    end_f = min(total - 1, int(round(end_s * fps)))
+    if start_f >= end_f:
+        print(f"Khoảng cắt không hợp lệ: frame {start_f} -> {end_f} (total={total})")
+        cam.close()
+        sys.exit(1)
+
+    base = os.path.splitext(os.path.basename(input_svo))[0]
+    out_path = os.path.join(clip_dir, f"{base}_clip_{start_f}_{end_f}.svo2")
+
+    # Ghi ra SVO2 mới, dùng H.265 lossless để giữ chất lượng
+    rec = sl.RecordingParameters(out_path, sl.SVO_COMPRESSION_MODE.H265)
+    if cam.enable_recording(rec) != sl.ERROR_CODE.SUCCESS:
+        print("Không bật được recording để cắt")
+        cam.close()
+        sys.exit(1)
+
+    # Nhảy tới frame bắt đầu
+    cam.set_svo_position(start_f)
+    runtime = sl.RuntimeParameters()
+    written = 0
+    n_target = end_f - start_f + 1
+
+    print(f"Cắt SVO: frame {start_f} -> {end_f} ({start_s:.1f}s -> {end_s:.1f}s), "
+          f"{n_target} frame @ {fps}fps")
+
+    while True:
+        if cam.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            break
+        # Ghi frame hiện tại (grab tự động ghi khi recording bật)
+        written += 1
+        cur = cam.get_svo_position()
+        if cur >= end_f:
+            break
+        if written % 30 == 0:
+            print(f"\r  cắt {written}/{n_target}", end="", flush=True)
+
+    cam.disable_recording()
+    cam.close()
+    print(f"\nĐã lưu file cắt: {out_path} ({written} frame)")
+    return out_path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
     ap.add_argument("output")
+    ap.add_argument("--start", required=True,
+                    help="Thời điểm bắt đầu cắt, định dạng HH:MM:SS (vd 00:00:02)")
+    ap.add_argument("--end", required=True,
+                    help="Thời điểm kết thúc cắt, định dạng HH:MM:SS (vd 00:00:41)")
+    ap.add_argument("--clip-dir", required=True,
+                    help="Thư mục lưu file SVO2 đã cắt")
     ap.add_argument("--max-frames", type=int, default=0)
     args = ap.parse_args()
 
+    # ---- BƯỚC 1: Cắt SVO2 theo start/end ----
+    start_s = parse_hhmmss(args.start)
+    end_s = parse_hhmmss(args.end)
+    clipped_svo = clip_svo(args.input, args.clip_dir, start_s, end_s)
+
+    # ---- BƯỚC 2: Convert file đã cắt sang MCAP ----
     init = sl.InitParameters()
-    init.set_from_svo_file(args.input)
+    init.set_from_svo_file(clipped_svo)
     init.svo_real_time_mode = False
     init.depth_mode = sl.DEPTH_MODE.PERFORMANCE
     init.coordinate_units = sl.UNIT.METER
