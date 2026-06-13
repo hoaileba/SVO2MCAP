@@ -102,11 +102,20 @@ class H265Encoder:
         f = int(round(fps)) or 30
         self.codec.framerate = fractions.Fraction(f, 1)
         self.codec.time_base = fractions.Fraction(1, f)
-        self.codec.options = {"preset": "fast", "x265-params": "log-level=none"}
+        # zerolatency + bframes=0 -> mỗi encode() trả packet ngay (1 frame = 1 packet)
+        self.codec.options = {
+            "preset": "fast",
+            "tune": "zerolatency",
+            "x265-params": "bframes=0:log-level=none",
+        }
+        self._pts = 0
 
     def encode_bgr(self, bgr: np.ndarray) -> bytes:
         frame = av.VideoFrame.from_ndarray(bgr, format="bgr24")
         frame = frame.reformat(format="yuv420p")
+        frame.pts = self._pts
+        frame.time_base = self.codec.time_base
+        self._pts += 1
         out = b""
         for pkt in self.codec.encode(frame):
             out += bytes(pkt)
@@ -122,16 +131,16 @@ class H265Encoder:
 def make_calibration(ts, frame_id, w, h, cp):
     fx, fy, cx, cy = cp.fx, cp.fy, cp.cx, cp.cy
     disto = list(cp.disto)
-    while len(disto) < 5:
+    # rational_polynomial dùng 8 hệ số: k1,k2,p1,p2,k3,k4,k5,k6
+    while len(disto) < 8:
         disto.append(0.0)
-    D = [float(x) for x in disto[:5]]
+    D = [float(x) for x in disto[:8]]
     K = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
     R = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     P = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
-    # Tên field built-in có thể là d/k/r/p (thường) -> chỉnh nếu help() báo khác
     return CameraCalibration(
         timestamp=ts, frame_id=frame_id, width=w, height=h,
-        distortion_model="plumb_bob", D=D, K=K, R=R, P=P,
+        distortion_model="rational_polynomial", D=D, K=K, R=R, P=P,
     )
 
 
@@ -224,6 +233,12 @@ def main():
     ap.add_argument("--clip-dir", required=True,
                     help="Thư mục lưu file SVO2 đã cắt")
     ap.add_argument("--max-frames", type=int, default=0)
+    # Metadata session (ghi vào MCAP)
+    ap.add_argument("--task-id", default="")
+    ap.add_argument("--environment-id", default="")
+    ap.add_argument("--operator-id", default="")
+    ap.add_argument("--episode-uuid", default="")
+    ap.add_argument("--task-description", default="")
     args = ap.parse_args()
 
     # ---- BƯỚC 1: Cắt SVO2 theo start/end ----
@@ -267,15 +282,26 @@ def main():
     pose = sl.Pose()
     runtime = sl.RuntimeParameters()
 
-    # Channel JSON cho 2 topic thiếu schema built-in
-    imu_ch = Channel("/ego/imu", schema={"type": "object", "properties": IMU_SCHEMA["properties"]})
-    sysinfo_ch = Channel("/ego/vio/system_info",
-                         schema={"type": "object", "properties": ROBOTINFO_SCHEMA["properties"]})
+    # Channel JSON cho 2 topic thiếu schema built-in.
+    # Dùng foxglove.Schema với name rõ ràng để Foxglove không hiện tên ngẫu nhiên.
+    imu_schema = foxglove.Schema(
+        name="foxglove.IMUMeasurement",
+        encoding="jsonschema",
+        data=json.dumps({"type": "object", "properties": IMU_SCHEMA["properties"]}).encode("utf-8"),
+    )
+    sysinfo_schema = foxglove.Schema(
+        name="foxglove.RobotInfo",
+        encoding="jsonschema",
+        data=json.dumps({"type": "object", "properties": ROBOTINFO_SCHEMA["properties"]}).encode("utf-8"),
+    )
+    imu_ch = Channel("/ego/imu", message_encoding="json", schema=imu_schema)
+    sysinfo_ch = Channel("/ego/vio/system_info", message_encoding="json", schema=sysinfo_schema)
 
     writer = foxglove.open_mcap(args.output, allow_overwrite=True)
 
     written = 0
     first_ns = None
+    last_ns = None
 
     while True:
         err = cam.grab(runtime)
@@ -290,13 +316,14 @@ def main():
 
         if first_ns is None:
             first_ns = ns
-            # system_info (JSON, ghi 1 lần)
+            # system_info (JSON, ghi 1 lần) - theo format đích
             sysinfo_ch.log({
-                "name": f"ZED {model}",
-                "description": "ZED stereo camera converted from SVO2",
-                "world_frame": "map",
-                "body_frame": "zed_camera",
-                "coordinate_convention": "RIGHT_HANDED_Z_UP_X_FWD",
+                "name": f"ZED {model} VIO",
+                "description": "ZED SDK visual-inertial odometry (positional tracking). "
+                               "Pose = transform world->headset.",
+                "world_frame": "ego_vio_world",
+                "body_frame": "ego_head",
+                "coordinate_convention": "right-handed, Z up, X forward (ROS REP-103)",
                 "serial_number": str(serial),
                 "firmware_version": str(fw),
             }, log_time=ns)
@@ -307,12 +334,13 @@ def main():
             foxglove.log("/top-right-camera/camera-info",
                          make_calibration(ts, "top_right_camera", W, H, calib_raw.right_cam),
                          log_time=ns)
+            # tf-static: left -> right, baseline theo trục X
             foxglove.log("/tf-static", FrameTransforms(transforms=[
                 FrameTransform(
                     timestamp=ts,
                     parent_frame_id="top_left_camera",
                     child_frame_id="top_right_camera",
-                    translation=Vector3(x=0.0, y=-baseline, z=0.0),
+                    translation=Vector3(x=baseline, y=0.0, z=0.0),
                     rotation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
                 )
             ]), log_time=ns)
@@ -325,7 +353,7 @@ def main():
         lin = imu.get_linear_acceleration()
         imu_ch.log({
             "timestamp": ts_dict(ns),
-            "frame_id": "zed_imu",
+            "frame_id": "imu_link",
             "orientation": {"x": ori[0], "y": ori[1], "z": ori[2], "w": ori[3]},
             "angular_velocity": {
                 "x": float(np.deg2rad(ang[0])),
@@ -335,21 +363,21 @@ def main():
             "linear_acceleration": {"x": lin[0], "y": lin[1], "z": lin[2]},
         }, log_time=ns)
 
-        # Pose VIO
+        # Pose VIO (world -> headset), giữ translation thật
         cam.get_position(pose, sl.REFERENCE_FRAME.WORLD)
         tr = pose.get_translation().get()
         q = pose.get_orientation().get()
         foxglove.log("/ego/vio/pose", FrameTransforms(transforms=[
             FrameTransform(
                 timestamp=ts,
-                parent_frame_id="map",
-                child_frame_id="zed_camera",
+                parent_frame_id="ego_vio_world",
+                child_frame_id="ego_head",
                 translation=Vector3(x=tr[0], y=tr[1], z=tr[2]),
                 rotation=Quaternion(x=q[0], y=q[1], z=q[2], w=q[3]),
             )
         ]), log_time=ns)
 
-        # Ảnh -> H.265
+        # Ảnh -> H.265 (zerolatency: mỗi frame trả packet ngay)
         cam.retrieve_image(img_left, sl.VIEW.LEFT)
         cam.retrieve_image(img_right, sl.VIEW.RIGHT)
         bgr_l = img_left.get_data()[:, :, :3].copy()
@@ -363,11 +391,13 @@ def main():
         ]:
             data = enc.encode_bgr(bgr)
             if not data:
+                # zerolatency hiếm khi rỗng; nếu có, frame nằm trong packet kế tiếp
                 continue
             foxglove.log(topic, CompressedVideo(
                 timestamp=ts, frame_id=fid, data=data, format="h265",
             ), log_time=ns)
 
+        last_ns = ns
         written += 1
         if written % 30 == 0:
             pct = written / total * 100 if total else 0
@@ -376,6 +406,8 @@ def main():
         if args.max_frames and written >= args.max_frames:
             break
 
+    # Flush phần còn trong buffer (nếu có) - gán timestamp frame CUỐI, không phải đầu
+    flush_ns = last_ns if last_ns is not None else first_ns
     for topic, enc, fid in [
         ("/top-left-camera/image-raw", enc_left, "top_left_camera"),
         ("/top-right-camera/image-raw", enc_right, "top_right_camera"),
@@ -384,8 +416,28 @@ def main():
         data = enc.flush()
         if data:
             foxglove.log(topic, CompressedVideo(
-                timestamp=ns_to_ts(first_ns), frame_id=fid, data=data, format="h265",
-            ), log_time=first_ns)
+                timestamp=ns_to_ts(flush_ns), frame_id=fid, data=data, format="h265",
+            ), log_time=flush_ns)
+
+    # ---- Ghi session-metadata vào MCAP ----
+    session_meta = {
+        "task_description": args.task_description,
+        "environment": args.environment_id,
+        "task-id": args.task_id,
+        "environment-id": args.environment_id,
+        "operator-id": args.operator_id,
+        "episode-uuid": args.episode_uuid,
+        "start_time_unix": str(int(first_ns // 1_000_000_000)) if first_ns else "",
+        "end_time_unix": str(int(last_ns // 1_000_000_000)) if last_ns else "",
+    }
+    # Loại bỏ key rỗng để metadata gọn
+    session_meta = {k: v for k, v in session_meta.items() if v != ""}
+    try:
+        writer.write_metadata("session-metadata", session_meta)
+        print("Đã ghi session-metadata")
+    except AttributeError:
+        print("CẢNH BÁO: writer không có write_metadata; "
+              "chạy 'help(foxglove.open_mcap)' / 'dir(writer)' để xem API ghi metadata.")
 
     writer.close()
     cam.disable_positional_tracking()
