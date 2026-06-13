@@ -64,6 +64,8 @@ def main():
     counts = OrderedDict()       # topic -> count
     schema_of = {}               # topic -> (schema_name, encoding)
     first_msg = {}               # topic -> decoded sample (message đầu tiên)
+    min_ns = None                # log_time nhỏ nhất (start)
+    max_ns = None                # log_time lớn nhất (end)
 
     with open(args.mcap_file, "rb") as f:
         reader = make_reader(f)
@@ -79,6 +81,12 @@ def main():
             if topic not in first_msg:
                 first_msg[topic] = decode_message(schema, message)
 
+            lt = message.log_time
+            if min_ns is None or lt < min_ns:
+                min_ns = lt
+            if max_ns is None or lt > max_ns:
+                max_ns = lt
+
     # ---- Xây dựng cấu trúc YAML ----
     topics_out = []
     for topic in sorted(counts.keys()):
@@ -92,7 +100,17 @@ def main():
             ("sample_value", sample),
         ]))
 
-    out = OrderedDict([("topics", topics_out)])
+    # ---- Thời gian unix (giây) của toàn bộ MCAP ----
+    start_unix = int(min_ns // 1_000_000_000) if min_ns is not None else 0
+    end_unix = int(max_ns // 1_000_000_000) if max_ns is not None else 0
+    duration_s = (max_ns - min_ns) / 1e9 if (min_ns is not None and max_ns is not None) else 0.0
+
+    out = OrderedDict([
+        ("start_time_unix", start_unix),
+        ("end_time_unix", end_unix),
+        ("duration_seconds", round(duration_s, 3)),
+        ("topics", topics_out),
+    ])
 
     # YAML giữ thứ tự key (OrderedDict)
     class OrderedDumper(yaml.SafeDumper):
@@ -108,6 +126,9 @@ def main():
                   allow_unicode=True, sort_keys=False, default_flow_style=False)
 
     print(f"Đã xuất {args.output}")
+    print(f"start_time_unix: {start_unix}")
+    print(f"end_time_unix:   {end_unix}")
+    print(f"duration:        {duration_s:.3f} s")
     print(f"Tổng số topic: {len(counts)}")
     for topic in sorted(counts.keys()):
         print(f"  {topic:35s} {schema_of[topic][0]:30s} count={counts[topic]}")
